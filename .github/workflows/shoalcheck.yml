@@ -1,0 +1,105 @@
+# shoalcheck gate on every pull request — docs/ci/github-actions.yml from the product, with the staging cluster
+# swapped for kind so the demonstration needs no cloud account. In your pipeline, the "A cluster to read" step is
+# your own credential step and --context names your staging cluster.
+name: shoalcheck gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      record_baseline:
+        description: "Record .shoalcheck/baseline.json from this run (kept as an artifact, to commit)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write   # the SARIF upload below
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: 0.1.0-rc.9
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.5.2
+
+      # The published release, its signature checked with the release key, then the archive against its checksum.
+      - name: Install shoalcheck
+        run: |
+          base="https://github.com/Shoalcheck/shoalcheck/releases/download/v${VERSION}"
+          archive="shoalcheck_${VERSION}_linux_amd64.tar.gz"
+          for f in "$archive" checksums.txt checksums.txt.sigstore.json cosign.pub; do
+            curl -fsSLO "$base/$f"
+          done
+          cosign verify-blob --key cosign.pub --bundle checksums.txt.sigstore.json checksums.txt
+          grep " $archive\$" checksums.txt | sha256sum -c -
+          sudo tar xz -C /usr/local/bin -f "$archive" shoalcheck
+          shoalcheck version
+
+      # In your pipeline this is your staging cluster. Here it is kind, built from this pull request's manifests,
+      # with the kind binary and the node image pinned and checked.
+      - name: A cluster to read
+        run: |
+          curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.32.0/kind-linux-amd64
+          echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  kind" | sha256sum -c -
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+          kind create cluster --name staging --wait 120s \
+            --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+          kubectl apply -f k8s/
+          kubectl -n shop rollout status deploy/checkout --timeout=180s
+
+      - name: Gate
+        env:
+          SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck
+          SHOALCHECK_LICENCE: ${{ secrets.SHOALCHECK_LICENCE }}
+          RECORD: ${{ inputs.record_baseline }}
+          LABEL: run ${{ github.run_number }} of ${{ github.event_name }}
+        run: |
+          record=""
+          if [ "$RECORD" = "true" ]; then record="--update-baseline"; fi
+          set +e
+          shoalcheck gate \
+            --context kind-staging \
+            --baseline .shoalcheck/baseline.json \
+            --fail-on new:high,regressed,unreadable \
+            --output "$RUNNER_TEMP/report.html" \
+            --json shoalcheck-reading.json \
+            --label "$LABEL" \
+            $record -o text > gate.txt
+          code=$?
+          set -e
+          cat gate.txt
+          { echo '### shoalcheck gate'; echo '```'; cat gate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: Findings as SARIF
+        if: always() && hashFiles('shoalcheck-reading.json') != ''
+        env:
+          SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck
+          SHOALCHECK_LICENCE: ${{ secrets.SHOALCHECK_LICENCE }}
+        run: shoalcheck findings --input shoalcheck-reading.json -o sarif > "$RUNNER_TEMP/shoalcheck.sarif"
+
+      - name: Upload to code scanning
+        if: always() && hashFiles('shoalcheck-reading.json') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/shoalcheck.sarif
+          category: shoalcheck
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shoalcheck-report
+          path: |
+            ${{ runner.temp }}/report.html
+            shoalcheck-reading.json
+            .shoalcheck/baseline.json
+          if-no-files-found: ignore
