@@ -1,6 +1,11 @@
-# shoalcheck gate on every pull request — docs/ci/github-actions.yml from the product, with the staging cluster
-# swapped for kind so the demonstration needs no cloud account. In your pipeline, the "A cluster to read" step is
-# your own credential step and --context names your staging cluster.
+# shoalcheck gate on every pull request — the product's GitHub Actions job (https://shoalcheck.github.io/ci/github-actions.yml)
+# with the staging cluster swapped for kind, so the demonstration needs no cloud account.
+#
+# ONE DIFFERENCE, AND WHY. In your pipeline the cluster is long-lived and the baseline is a file in your repository.
+# shoalcheck refuses to compare readings of two different clusters (it knows a cluster by its kube-system namespace),
+# and kind is a new cluster every run, so here the baseline is recorded in the same run: the cluster is built from the
+# manifests the pull request starts from, read, then given the pull request's manifests and read again. The gate
+# answers what this change did to the cluster.
 name: shoalcheck gate
 
 on:
@@ -8,11 +13,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      record_baseline:
-        description: "Record .shoalcheck/baseline.json from this run (kept as an artifact, to commit)"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -22,29 +22,38 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     env:
-      VERSION: 0.1.0-rc.9
+      VERSION: 0.1.0-rc.10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the commit the change starts from is read too
 
       - uses: sigstore/cosign-installer@v3
         with:
           cosign-release: v2.5.2
 
-      # The published release, its signature checked with the release key, then the archive against its checksum.
+      # The published release, its signature checked with the release key written here (a key fetched from the
+      # release it vouches for proves nothing), then the archive against its checksum.
       - name: Install shoalcheck
         run: |
           base="https://github.com/Shoalcheck/shoalcheck/releases/download/v${VERSION}"
           archive="shoalcheck_${VERSION}_linux_amd64.tar.gz"
-          for f in "$archive" checksums.txt checksums.txt.sigstore.json cosign.pub; do
+          for f in "$archive" checksums.txt checksums.txt.sigstore.json; do
             curl -fsSLO "$base/$f"
           done
+          cat > cosign.pub <<'KEY'
+          -----BEGIN PUBLIC KEY-----
+          MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE69u2ja9r2k/Vy8lSibowBdCnCD3P
+          OVzmcbjHVIvMgoOfkEzEwOY/b8kyjTVJcwrJ89+qC5bjW4XzLqz1S/AryQ==
+          -----END PUBLIC KEY-----
+          KEY
           cosign verify-blob --key cosign.pub --bundle checksums.txt.sigstore.json checksums.txt
           grep " $archive\$" checksums.txt | sha256sum -c -
           sudo tar xz -C /usr/local/bin -f "$archive" shoalcheck
           shoalcheck version
 
-      # In your pipeline this is your staging cluster. Here it is kind, built from this pull request's manifests,
-      # with the kind binary and the node image pinned and checked.
+      # In your pipeline this is your staging cluster. Here it is kind, with the kind binary and the node image
+      # pinned and checked.
       - name: A cluster to read
         run: |
           curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v0.32.0/kind-linux-amd64
@@ -52,33 +61,57 @@ jobs:
           chmod +x kind && sudo mv kind /usr/local/bin/kind
           kind create cluster --name staging --wait 120s \
             --image kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
-          kubectl apply -f k8s/
-          kubectl -n shop rollout status deploy/checkout --timeout=180s
 
+      # The baseline: the cluster as the manifests this change starts from leave it. A pull request starts from its
+      # base branch; a push to main from the commit before it; a manual run compares main with itself.
+      - name: The cluster before this change
+        env:
+          SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck
+          SHOALCHECK_LICENCE: ${{ secrets.SHOALCHECK_LICENCE }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          from="${PR_BASE:-$PUSH_BEFORE}"
+          case "$from" in ""|0000000000000000000000000000000000000000) from="$GITHUB_SHA" ;; esac
+          echo "FROM=$from" >> "$GITHUB_ENV"
+          git worktree add --detach "$RUNNER_TEMP/before" "$from"
+          kubectl apply -f "$RUNNER_TEMP/before/k8s/"
+          kubectl wait deployment --all --all-namespaces --for=condition=Available --timeout=180s
+          shoalcheck gate --context kind-staging --baseline "$RUNNER_TEMP/baseline.json" --update-baseline \
+            --label "before: ${from:0:7}" -o text
+
+      - name: This change, applied
+        run: |
+          kubectl apply -f k8s/
+          kubectl wait deployment --all --all-namespaces --for=condition=Available --timeout=180s
+
+      # The verdict in the job log and in the run's summary, and the exit code the job ends on: 0 the policy is
+      # satisfied, 2 it fired, 1 the run or the comparison could not be made, 4 the licence does not cover the gate.
       - name: Gate
         env:
           SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck
           SHOALCHECK_LICENCE: ${{ secrets.SHOALCHECK_LICENCE }}
-          RECORD: ${{ inputs.record_baseline }}
-          LABEL: run ${{ github.run_number }} of ${{ github.event_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          record=""
-          if [ "$RECORD" = "true" ]; then record="--update-baseline"; fi
+          head="${PR_HEAD:-$GITHUB_SHA}"
           set +e
           shoalcheck gate \
             --context kind-staging \
-            --baseline .shoalcheck/baseline.json \
+            --baseline "$RUNNER_TEMP/baseline.json" \
             --fail-on new:high,regressed,unreadable \
             --output "$RUNNER_TEMP/report.html" \
             --json shoalcheck-reading.json \
-            --label "$LABEL" \
-            $record -o text > gate.txt
+            --label "after: ${head:0:7}" \
+            -o text > gate.txt
           code=$?
           set -e
           cat gate.txt
-          { echo '### shoalcheck gate'; echo '```'; cat gate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$code" > gate.exit
+          { echo '### shoalcheck gate'; echo "${head:0:7} compared with ${FROM:0:7}: exit $code"; echo '```'; cat gate.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           exit $code
 
+      # The findings in code scanning, from the reading the gate judged, so the alert and the red build cannot
+      # disagree; `always()` because a failing gate is exactly when they are wanted.
       - name: Findings as SARIF
         if: always() && hashFiles('shoalcheck-reading.json') != ''
         env:
@@ -100,6 +133,8 @@ jobs:
           name: shoalcheck-report
           path: |
             ${{ runner.temp }}/report.html
+            ${{ runner.temp }}/baseline.json
             shoalcheck-reading.json
-            .shoalcheck/baseline.json
+            gate.txt
+            gate.exit
           if-no-files-found: ignore
