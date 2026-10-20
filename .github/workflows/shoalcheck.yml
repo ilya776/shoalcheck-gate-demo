@@ -22,7 +22,7 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     env:
-      VERSION: 0.1.0-rc.10
+      VERSION: 0.1.0-rc.11
     steps:
       - uses: actions/checkout@v4
         with:
